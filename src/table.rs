@@ -184,7 +184,7 @@ impl TableInner {
                 self.filename()
             )));
         }
-        self.biggest = it.key().clone();
+        self.biggest = Bytes::copy_from_slice(it.key().clone());
         Ok(())
     }
 

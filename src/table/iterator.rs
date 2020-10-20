@@ -2,7 +2,7 @@ use super::builder::{Header, HEADER_SIZE};
 use super::{Block, TableInner};
 use crate::util::{self, KeyComparitor, COMPARATOR};
 use crate::value::Value;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
@@ -41,7 +41,7 @@ enum SeekPos {
 struct BlockIterator {
     idx: isize,
     base_key: Bytes,
-    key: Bytes,
+    key: BytesMut,
     val: Bytes,
     data: Bytes,
     // TODO: use `&'a Block` if possible
@@ -57,7 +57,7 @@ impl BlockIterator {
             block,
             err: IteratorError::NoError,
             base_key: Bytes::new(),
-            key: Bytes::new(),
+            key: BytesMut::new(),
             val: Bytes::new(),
             data,
             perv_overlap: 0,
@@ -99,20 +99,16 @@ impl BlockIterator {
         let mut header = Header::default();
         header.decode(&mut entry_data);
 
-        // TODO: optimize base_key copy
-        // if header.overlap > self.perv_overlap {
-        //     self.key = Bytes::from(
-        //         [
-        //             &self.key[..self.perv_overlap as usize],
-        //             &self.base_key[self.perv_overlap as usize..header.overlap as usize],
-        //         ]
-        //         .concat(),
-        //     );
-        // }
-        // self.perv_overlap = header.overlap;
+        // TODO: merge this truncate with the following key truncate
+        if header.overlap > self.perv_overlap {
+            self.key.truncate(self.perv_overlap as usize);
+            self.key.extend_from_slice(&self.base_key[self.perv_overlap as usize..header.overlap as usize]);
+        }
+        self.perv_overlap = header.overlap;
 
         let diff_key = &entry_data[..header.diff as usize];
-        self.key = Bytes::from([&self.base_key[..header.overlap as usize], diff_key].concat());
+        self.key.truncate(header.overlap as usize);
+        self.key.extend_from_slice(diff_key);
         self.val = entry_data.slice(header.diff as usize..);
     }
 
@@ -374,8 +370,8 @@ impl<T: AsRef<TableInner>> Iterator<T> {
         }
     }
 
-    pub fn key(&self) -> &Bytes {
-        &self.block_iterator.as_ref().unwrap().key
+    pub fn key(&self) -> &[u8] {
+        &self.block_iterator.as_ref().unwrap().key[..]
     }
 
     pub fn value(&self) -> Value {
