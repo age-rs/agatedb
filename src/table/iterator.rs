@@ -203,7 +203,7 @@ pub const ITERATOR_NOCACHE: usize = 1 << 2;
 ///
 /// The generic represents a reference to `TableInner` struct.
 /// It should be `Arc<TableInner>` or &TableInner.
-/// 
+///
 /// Here we use generic because when initializaing a
 /// table object, we need to get smallest and biggest
 /// elements by using an iterator over `&TableInner`.
@@ -330,13 +330,15 @@ impl<T: AsRef<TableInner>> Iterator<T> {
         }
     }
 
-    // seek_inner will reset iterator and seek to >= key.
+    /// seek_inner will reset iterator and seek to >= key.
     fn seek_inner(&mut self, key: &Bytes) {
         self.seek_from(key, SeekPos::Origin);
     }
 
-    // seek_for_prev will reset iterator and seek to <= key.
-    fn seek_for_prev(&mut self, key: &Bytes) {
+    /// seek_for_prev will reset iterator and seek to <= key.
+    ///
+    /// This function will only be called in tests outside this mod
+    pub(crate) fn seek_for_prev(&mut self, key: &Bytes) {
         self.seek_from(key, SeekPos::Origin);
         if self.key() != key {
             self.prev_inner();
