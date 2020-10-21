@@ -5,9 +5,9 @@ use crate::value::Value;
 use bytes::{Bytes, BytesMut};
 use std::sync::Arc;
 
+/// Errors that may encounter during iterator operation
 #[derive(Clone, Debug)]
 pub enum IteratorError {
-    NoError,
     EOF,
     // TODO: As we need to clone Error from block iterator to table iterator,
     // we had to save `crate::Error` as String. In the future, we could let all
@@ -17,18 +17,14 @@ pub enum IteratorError {
 }
 
 impl IteratorError {
-    pub fn is_err(&self) -> bool {
-        match self {
-            IteratorError::NoError => false,
-            _ => true,
-        }
+    /// Check if iterator has reached its end
+    pub fn is_eof(&self) -> bool {
+        matches!(self, IteratorError::EOF)
     }
 
-    pub fn is_eof(&self) -> bool {
-        match self {
-            IteratorError::EOF => true,
-            _ => false,
-        }
+    /// Utility function to check if an Option<IteratorError> is EOF
+    pub fn check_eof(err: &Option<IteratorError>) -> bool {
+        matches!(err, Some(IteratorError::EOF))
     }
 }
 
@@ -37,17 +33,27 @@ enum SeekPos {
     Current,
 }
 
+/// Block iterator iterates on an SST block
 // TODO: support custom comparator
 struct BlockIterator {
+    /// current index of iterator
     idx: isize,
+    /// base key of the block
     base_key: Bytes,
+    /// key of current entry
     key: BytesMut,
+    /// raw value of current entry
     val: Bytes,
+    /// block data in bytes
     data: Bytes,
+    /// block struct
     // TODO: use `&'a Block` if possible
     block: Arc<Block>,
+    /// previous overlap key, used to construct key of current entry from
+    /// previous one faster
     perv_overlap: u16,
-    err: IteratorError,
+    /// iterator error in last operation
+    err: Option<IteratorError>,
 }
 
 impl BlockIterator {
@@ -55,7 +61,7 @@ impl BlockIterator {
         let data = block.data.slice(..block.entries_index_start);
         Self {
             block,
-            err: IteratorError::NoError,
+            err: None,
             base_key: Bytes::new(),
             key: BytesMut::new(),
             val: Bytes::new(),
@@ -63,6 +69,18 @@ impl BlockIterator {
             perv_overlap: 0,
             idx: 0,
         }
+    }
+
+    /// Replace block inside iterator and reset the iterator
+    pub fn set_block(&mut self, block: Arc<Block>) {
+        self.err = None;
+        self.idx = 0;
+        self.base_key.clear();
+        self.perv_overlap = 0;
+        self.key.clear();
+        self.val.clear();
+        self.data = block.data.slice(..block.entries_index_start);
+        self.block = block;
     }
 
     #[inline]
@@ -73,11 +91,11 @@ impl BlockIterator {
     fn set_idx(&mut self, i: isize) {
         self.idx = i;
         if i >= self.entry_offsets().len() as isize || i < 0 {
-            self.err = IteratorError::EOF;
+            self.err = Some(IteratorError::EOF);
             return;
         }
 
-        self.err = IteratorError::NoError;
+        self.err = None;
         let start_offset = self.entry_offsets()[i as usize] as u32;
 
         if self.base_key.is_empty() {
@@ -102,7 +120,9 @@ impl BlockIterator {
         // TODO: merge this truncate with the following key truncate
         if header.overlap > self.perv_overlap {
             self.key.truncate(self.perv_overlap as usize);
-            self.key.extend_from_slice(&self.base_key[self.perv_overlap as usize..header.overlap as usize]);
+            self.key.extend_from_slice(
+                &self.base_key[self.perv_overlap as usize..header.overlap as usize],
+            );
         }
         self.perv_overlap = header.overlap;
 
@@ -112,20 +132,25 @@ impl BlockIterator {
         self.val = entry_data.slice(header.diff as usize..);
     }
 
+    /// Check if last operation of iterator is error
+    /// TODO: use `Result<()>` for all iterator operation and remove this if possible
     pub fn valid(&self) -> bool {
-        !self.err.is_err()
+        self.err.is_none()
     }
 
-    pub fn error(&self) -> &IteratorError {
-        &self.err
+    /// Return error of last operation
+    pub fn error(&self) -> Option<&IteratorError> {
+        self.err.as_ref()
     }
 
+    /// Seek to the first entry that is equal or greater than key
     pub fn seek(&mut self, key: &Bytes, whence: SeekPos) {
-        self.err = IteratorError::NoError;
+        self.err = None;
         let start_index = match whence {
             SeekPos::Origin => 0,
             SeekPos::Current => self.idx,
         };
+
         let found_entry_idx = util::search(self.entry_offsets().len(), |idx| {
             use std::cmp::Ordering::*;
             if idx < start_index as usize {
@@ -172,38 +197,50 @@ pub struct Iterator<T: AsRef<TableInner>> {
     table: T,
     bpos: isize,
     block_iterator: Option<BlockIterator>,
-    err: IteratorError,
+    err: Option<IteratorError>,
     opt: usize,
 }
 
 impl<T: AsRef<TableInner>> Iterator<T> {
+    /// Create an iterator from `Arc<TableInner>` or `&TableInner`
     pub fn new(table: T, opt: usize) -> Self {
         Self {
             table,
             bpos: 0,
             block_iterator: None,
-            err: IteratorError::NoError,
+            err: None,
             opt,
         }
     }
 
     pub fn reset(&mut self) {
         self.bpos = 0;
-        self.err = IteratorError::NoError;
+        self.err = None;
     }
 
     pub fn valid(&self) -> bool {
-        !self.err.is_err()
+        self.err.is_none()
     }
 
     pub fn use_cache(&self) -> bool {
         self.opt & ITERATOR_NOCACHE == 0
     }
 
+    fn get_block_iterator(&mut self, block: Arc<Block>) -> &mut BlockIterator {
+        if self.block_iterator.is_none() {
+            self.block_iterator = Some(BlockIterator::new(block));
+            self.block_iterator.as_mut().unwrap()
+        } else {
+            let iter = self.block_iterator.as_mut().unwrap();
+            iter.set_block(block);
+            iter
+        }
+    }
+
     pub fn seek_to_first(&mut self) {
         let num_blocks = self.table.as_ref().offsets_length();
         if num_blocks == 0 {
-            self.err = IteratorError::EOF;
+            self.err = Some(IteratorError::EOF);
             return;
         }
         self.bpos = 0;
@@ -213,19 +250,18 @@ impl<T: AsRef<TableInner>> Iterator<T> {
             .block(self.bpos as usize, self.use_cache())
         {
             Ok(block) => {
-                let mut block_iterator = BlockIterator::new(block);
+                let block_iterator = self.get_block_iterator(block);
                 block_iterator.seek_to_first();
                 self.err = block_iterator.err.clone();
-                self.block_iterator = Some(block_iterator);
             }
-            Err(err) => self.err = IteratorError::Error(err.to_string()),
+            Err(err) => self.err = Some(IteratorError::Error(err.to_string())),
         }
     }
 
     pub fn seek_to_last(&mut self) {
         let num_blocks = self.table.as_ref().offsets_length();
         if num_blocks == 0 {
-            self.err = IteratorError::EOF;
+            self.err = Some(IteratorError::EOF);
             return;
         }
         self.bpos = num_blocks as isize - 1;
@@ -235,12 +271,11 @@ impl<T: AsRef<TableInner>> Iterator<T> {
             .block(self.bpos as usize, self.use_cache())
         {
             Ok(block) => {
-                let mut block_iterator = BlockIterator::new(block);
+                let block_iterator = self.get_block_iterator(block);
                 block_iterator.seek_to_last();
                 self.err = block_iterator.err.clone();
-                self.block_iterator = Some(block_iterator);
             }
-            Err(err) => self.err = IteratorError::Error(err.to_string()),
+            Err(err) => self.err = Some(IteratorError::Error(err.to_string())),
         }
     }
 
@@ -252,17 +287,16 @@ impl<T: AsRef<TableInner>> Iterator<T> {
             .block(self.bpos as usize, self.use_cache())
         {
             Ok(block) => {
-                let mut block_iterator = BlockIterator::new(block);
+                let block_iterator = self.get_block_iterator(block);
                 block_iterator.seek(key, SeekPos::Origin);
                 self.err = block_iterator.err.clone();
-                self.block_iterator = Some(block_iterator);
             }
-            Err(err) => self.err = IteratorError::Error(err.to_string()),
+            Err(err) => self.err = Some(IteratorError::Error(err.to_string())),
         }
     }
 
     fn seek_from(&mut self, key: &Bytes, whence: SeekPos) {
-        self.err = IteratorError::NoError;
+        self.err = None;
         match whence {
             SeekPos::Origin => self.reset(),
             _ => {}
@@ -283,7 +317,7 @@ impl<T: AsRef<TableInner>> Iterator<T> {
         }
 
         self.seek_helper(idx - 1, key);
-        if self.err.is_eof() {
+        if IteratorError::check_eof(&self.err) {
             if idx == self.table.as_ref().offsets_length() {
                 return;
             }
@@ -305,10 +339,10 @@ impl<T: AsRef<TableInner>> Iterator<T> {
     }
 
     fn next_inner(&mut self) {
-        self.err = IteratorError::NoError;
+        self.err = None;
 
         if self.bpos as usize > self.table.as_ref().offsets_length() {
-            self.err = IteratorError::EOF;
+            self.err = Some(IteratorError::EOF);
             return;
         }
 
@@ -319,12 +353,11 @@ impl<T: AsRef<TableInner>> Iterator<T> {
                 .block(self.bpos as usize, self.use_cache())
             {
                 Ok(block) => {
-                    let mut block_iterator = BlockIterator::new(block);
+                    let block_iterator = self.get_block_iterator(block);
                     block_iterator.seek_to_first();
                     self.err = block_iterator.err.clone();
-                    self.block_iterator = Some(block_iterator);
                 }
-                Err(err) => self.err = IteratorError::Error(err.to_string()),
+                Err(err) => self.err = Some(IteratorError::Error(err.to_string())),
             }
         } else {
             let bi = self.block_iterator.as_mut().unwrap();
@@ -338,10 +371,10 @@ impl<T: AsRef<TableInner>> Iterator<T> {
     }
 
     fn prev_inner(&mut self) {
-        self.err = IteratorError::NoError;
+        self.err = None;
 
         if self.bpos < 0 {
-            self.err = IteratorError::EOF;
+            self.err = Some(IteratorError::EOF);
             return;
         }
 
@@ -352,12 +385,11 @@ impl<T: AsRef<TableInner>> Iterator<T> {
                 .block(self.bpos as usize, self.use_cache())
             {
                 Ok(block) => {
-                    let mut block_iterator = BlockIterator::new(block);
+                    let block_iterator = self.get_block_iterator(block);
                     block_iterator.seek_to_last();
                     self.err = block_iterator.err.clone();
-                    self.block_iterator = Some(block_iterator);
                 }
-                Err(err) => self.err = IteratorError::Error(err.to_string()),
+                Err(err) => self.err = Some(IteratorError::Error(err.to_string())),
             }
         } else {
             let bi = self.block_iterator.as_mut().unwrap();
@@ -371,7 +403,7 @@ impl<T: AsRef<TableInner>> Iterator<T> {
     }
 
     pub fn key(&self) -> &[u8] {
-        &self.block_iterator.as_ref().unwrap().key[..]
+        &self.block_iterator.as_ref().unwrap().key
     }
 
     pub fn value(&self) -> Value {
@@ -412,7 +444,21 @@ impl<T: AsRef<TableInner>> Iterator<T> {
         }
     }
 
-    pub fn error(&self) -> &IteratorError {
-        &self.err
+    pub fn error(&self) -> Option<&IteratorError> {
+        self.err.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_iterator_error() {
+        let ite1 = IteratorError::EOF;
+        assert!(ite1.is_eof());
+
+        let ite3 = IteratorError::Error("23333".to_string());
+        assert!(!ite3.is_eof());
     }
 }
